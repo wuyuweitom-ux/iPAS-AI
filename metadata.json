@@ -1,0 +1,8 @@
+{
+  "name": "iPAS AI應用規畫師備考助教 (GitHub Repo Ready)",
+  "description": "專業 iPAS AI應用規畫師 AI 備考助教與全端開源專案。",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

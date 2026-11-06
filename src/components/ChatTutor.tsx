@@ -1,0 +1,850 @@
+import React, { useState, useRef, useEffect } from 'react';
+import {
+  Send,
+  Sparkles,
+  Bot,
+  User,
+  Lightbulb,
+  Compass,
+  Scale,
+  Calculator,
+  Globe,
+  Copy,
+  Check,
+  RotateCcw,
+  Volume2,
+  VolumeX,
+  ExternalLink,
+  Key,
+  FileText,
+  Database,
+  BookOpen,
+  ChevronDown,
+  ChevronUp,
+} from 'lucide-react';
+import { ChatMessage, TutorMode } from '../types';
+import { streamGeminiChat, hasApiKey, getStoredModel } from '../services/geminiService';
+import { exportNotesToPdf } from '../utils/pdfExport';
+import {
+  formatInlineRichText,
+  convertLatexToHtml,
+  normalizeBlockMath,
+  cleanTextForSpeech,
+} from '../utils/formatMathAndMarkdown';
+
+interface ChatTutorProps {
+  initialPrompt?: string;
+  onClearInitialPrompt?: () => void;
+  onOpenApiKeyModal?: () => void;
+  onOpenRagTab?: () => void;
+}
+
+export const ChatTutor: React.FC<ChatTutorProps> = ({
+  initialPrompt,
+  onClearInitialPrompt,
+  onOpenApiKeyModal,
+}) => {
+  const [messages, setMessages] = useState<ChatMessage[]>([
+    {
+      id: 'welcome-1',
+      role: 'assistant',
+      content: `你好！我是你的 **iPAS AI 應用規劃師 (初級能力鑑定) 專屬 AI 備考助教**！🤖✨
+
+已完整載入經濟部官方學習指引、115 年第一次與 114 年第四次 200 題真題詳解庫，以及數位發展部公部門手冊與產業種子教材：
+- 📘 **科目一**：人工智慧基礎概論（AI定義與人在迴圈、資料前處理與特徵工程、機器學習三大範式、CNN/RNN/Transformer架構、混淆矩陣指標、XAI可解釋性、行政院《人工智慧基本法》草案與金融規範）。
+- 📗 **科目二**：生成式 AI 應用與規劃（No-Code/Low-Code治理、Transformer解碼器自回歸生成、提示工程CoT/ToT/Graph、RAG檢索增強、Agentic AI與MCP通訊協議、PoC評估、ROI/TCO計算、SynthID浮水印與資安防護）。
+
+你可以隨時貼上考題、詢問演算法觀念，或直接回答上一題的選項（例如輸入「B」），助教將以官方權威觀念為你即時批改、推導算式並剖析選項陷阱！`,
+      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+    },
+  ]);
+
+  const [input, setInput] = useState('');
+  const [isLoading, setIsLoading] = useState(false);
+  const [mode, setMode] = useState<TutorMode>('socratic');
+  const [enableSearch, setEnableSearch] = useState(false);
+  const [copiedId, setCopiedId] = useState<string | null>(null);
+  const [speakingId, setSpeakingId] = useState<string | null>(null);
+  const [isExportingPdf, setIsExportingPdf] = useState(false);
+  const [pdfProgress, setPdfProgress] = useState('');
+  const [expandedCitationMsgIds, setExpandedCitationMsgIds] = useState<Record<string, boolean>>({});
+
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
+
+  const scrollToBottom = () => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  };
+
+  useEffect(() => {
+    scrollToBottom();
+  }, [messages, isLoading]);
+
+  useEffect(() => {
+    if (initialPrompt) {
+      setInput(initialPrompt);
+      if (onClearInitialPrompt) onClearInitialPrompt();
+      inputRef.current?.focus();
+    }
+  }, [initialPrompt, onClearInitialPrompt]);
+
+  const quickPrompts = [
+    {
+      label: '💡 考我一題混淆矩陣與 Recall 計算',
+      prompt:
+        '請出一道關於混淆矩陣 (Confusion Matrix) 與 Recall/Precision/F1 評估指標的單選模擬題，列出選項，但暫時不要公布答案，請等待我的作答。',
+    },
+    {
+      label: '🤖 MCP 協議與 RAG 功能定位差異',
+      prompt:
+        '請幫我詳細說明 Model Context Protocol (MCP) 與檢索增強生成 (RAG) 在系統架構、運作流程 (Host-Client-Server) 與功能定位上的主要差異。',
+    },
+    {
+      label: '⚖️ 人在迴圈上 vs 迴圈內概念剖析',
+      prompt:
+        '請幫我剖析「人在迴圈上 (Human-over-the-loop)」與「人在迴圈內 (Human-in-the-loop)」的定義邊界與典型題型情境。',
+    },
+    {
+      label: '🧮 企業導入 AI 的 ROI 與 TCO 算式',
+      prompt:
+        '請出 1 道 iPAS 企業導入生成式 AI 的 ROI 投資回收期或 Token Economics 計算題，並引導計算步驟，讓我試算。',
+    },
+    {
+      label: '📜 《人工智慧基本法》草案重點',
+      prompt:
+        '請列舉我國行政院通過之《人工智慧基本法》草案核心要點，包含借鏡歐盟的監理沙盒 (Regulatory Sandbox) 以及金融機構作業規範的常考重點。',
+    },
+  ];
+
+  const handleSendMessage = async (textToSend?: string) => {
+    const userText = textToSend || input.trim();
+    if (!userText || isLoading) return;
+
+    const userMessage: ChatMessage = {
+      id: `user-${Date.now()}`,
+      role: 'user',
+      content: userText,
+      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+    };
+
+    const newMessages = [...messages, userMessage];
+    setMessages(newMessages);
+    setInput('');
+    setIsLoading(true);
+
+    const assistantId = `assistant-${Date.now()}`;
+    const assistantMessage: ChatMessage = {
+      id: assistantId,
+      role: 'assistant',
+      content: '',
+      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+    };
+
+    setMessages([...newMessages, assistantMessage]);
+
+    try {
+      let accumulatedContent = '';
+
+      await streamGeminiChat(
+        newMessages.map((m) => ({ role: m.role, content: m.content })),
+        mode,
+        enableSearch,
+        {
+          onChunk: (text: string) => {
+            accumulatedContent += text;
+            setMessages((prev) =>
+              prev.map((m) =>
+                m.id === assistantId ? { ...m, content: accumulatedContent } : m
+              )
+            );
+          },
+          onMetadata: (meta) => {
+            setMessages((prev) =>
+              prev.map((m) =>
+                m.id === assistantId
+                  ? {
+                      ...m,
+                      ragCitations: meta.ragCitations,
+                      groundingUrls: meta.groundingUrls,
+                      sourceMode: meta.sourceMode,
+                    }
+                  : m
+              )
+            );
+          },
+          onDone: () => {
+            setIsLoading(false);
+          },
+          onError: (err: Error) => {
+            setMessages((prev) =>
+              prev.map((m) =>
+                m.id === assistantId
+                  ? {
+                      ...m,
+                      content:
+                        accumulatedContent + `\n\n⚠️ **提示**：${err.message}`,
+                    }
+                  : m
+              )
+            );
+            setIsLoading(false);
+          },
+        }
+      );
+    } catch (err: unknown) {
+      const error = err as Error;
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === assistantId
+            ? {
+                ...m,
+                content: `發生錯誤：${error.message}`,
+              }
+            : m
+        )
+      );
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const handleCopy = (id: string, text: string) => {
+    navigator.clipboard.writeText(text);
+    setCopiedId(id);
+    setTimeout(() => setCopiedId(null), 2000);
+  };
+
+  const handleSpeak = (id: string, text: string) => {
+    if ('speechSynthesis' in window) {
+      if (speakingId === id) {
+        window.speechSynthesis.cancel();
+        setSpeakingId(null);
+        return;
+      }
+      window.speechSynthesis.cancel();
+      const cleanText = cleanTextForSpeech(text);
+      const utterance = new SpeechSynthesisUtterance(cleanText);
+      utterance.lang = 'zh-TW';
+      utterance.rate = 1.05;
+      utterance.onend = () => setSpeakingId(null);
+      utterance.onerror = () => setSpeakingId(null);
+      setSpeakingId(id);
+      window.speechSynthesis.speak(utterance);
+    }
+  };
+
+  const handleClearChat = () => {
+    if (window.confirm('確定要清空對話紀錄嗎？')) {
+      setMessages([
+        {
+          id: 'welcome-reset',
+          role: 'assistant',
+          content: '對話已重置。我是您的 100% 線上專屬 iPAS 淨零碳 AI 備考助教，隨時為您解答考點與批改考題！🌱',
+          timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+        },
+      ]);
+      if ('speechSynthesis' in window) {
+        window.speechSynthesis.cancel();
+        setSpeakingId(null);
+      }
+    }
+  };
+
+  const handleExportChatPdf = async () => {
+    if (isExportingPdf) return;
+    try {
+      setIsExportingPdf(true);
+      await exportNotesToPdf(messages, (status) => setPdfProgress(status));
+    } catch (err: unknown) {
+      const error = err as Error;
+      alert(`匯出 PDF 發生錯誤: ${error.message}`);
+    } finally {
+      setIsExportingPdf(false);
+      setPdfProgress('');
+    }
+  };
+
+  const toggleCitationExpand = (msgId: string) => {
+    setExpandedCitationMsgIds((prev) => ({
+      ...prev,
+      [msgId]: !prev[msgId],
+    }));
+  };
+
+  // Render markdown, chemical formulas (CO₂, CH₄...), and LaTeX calculation formulas cleanly
+  const renderFormattedContent = (content: string) => {
+    const normalized = normalizeBlockMath(content);
+    const paragraphs = normalized.split(/\n{2,}/);
+
+    return (
+      <div className="space-y-2.5 text-slate-100 text-sm leading-relaxed">
+        {paragraphs.map((rawParagraph, pIdx) => {
+          const paragraph = rawParagraph.trim();
+          if (!paragraph) return null;
+
+          // 1. 區塊數學公式 $$ ... $$
+          if (paragraph.startsWith('$$') && paragraph.endsWith('$$')) {
+            const innerMath = paragraph.slice(2, -2).trim();
+            return (
+              <div
+                key={pIdx}
+                className="bg-slate-950/90 border border-emerald-800/50 rounded-xl px-4 py-3 my-2 text-center text-base overflow-x-auto shadow-inner"
+                dangerouslySetInnerHTML={{
+                  __html: convertLatexToHtml(innerMath, false),
+                }}
+              />
+            );
+          }
+
+          // 2. 程式碼區塊 ``` ... ```
+          if (paragraph.startsWith('```')) {
+            const lines = paragraph.split('\n');
+            const code = lines.slice(1, -1).join('\n');
+            return (
+              <pre
+                key={pIdx}
+                className="bg-slate-950 p-3 rounded-lg overflow-x-auto text-xs text-emerald-200 border border-slate-800 font-mono my-2"
+              >
+                <code>{code}</code>
+              </pre>
+            );
+          }
+
+          // 3. 標題 H4 / H3 / H2
+          if (paragraph.startsWith('#### ')) {
+            return (
+              <h5
+                key={pIdx}
+                className="font-bold text-teal-300 text-sm mt-2"
+                dangerouslySetInnerHTML={{
+                  __html: formatInlineRichText(paragraph.replace(/^####\s+/, ''), false),
+                }}
+              />
+            );
+          }
+          if (paragraph.startsWith('### ')) {
+            return (
+              <h4
+                key={pIdx}
+                className="font-bold text-emerald-300 text-base mt-2"
+                dangerouslySetInnerHTML={{
+                  __html: formatInlineRichText(paragraph.replace(/^###\s+/, ''), false),
+                }}
+              />
+            );
+          }
+          if (paragraph.startsWith('## ') || paragraph.startsWith('# ')) {
+            return (
+              <h3
+                key={pIdx}
+                className="font-bold text-emerald-400 text-lg mt-3"
+                dangerouslySetInnerHTML={{
+                  __html: formatInlineRichText(paragraph.replace(/^#{1,2}\s+/, ''), false),
+                }}
+              />
+            );
+          }
+
+          // 4. 分隔線
+          if (paragraph === '---' || paragraph === '***') {
+            return <hr key={pIdx} className="border-slate-800 my-2" />;
+          }
+
+          // 5. Markdown 表格
+          const lines = paragraph.split('\n');
+          if (lines.length >= 2 && lines[0].includes('|') && lines[1].includes('---')) {
+            const headerCells = lines[0]
+              .split('|')
+              .map((c) => c.trim())
+              .filter(Boolean);
+            const bodyRows = lines.slice(2).map((r) =>
+              r
+                .split('|')
+                .map((c) => c.trim())
+                .filter(Boolean)
+            );
+            return (
+              <div key={pIdx} className="overflow-x-auto my-2 rounded-xl border border-slate-800">
+                <table className="w-full text-left text-xs text-slate-200">
+                  <thead className="bg-slate-950 text-emerald-300 border-b border-slate-800">
+                    <tr>
+                      {headerCells.map((hc, hIdx) => (
+                        <th
+                          key={hIdx}
+                          className="px-3 py-2 font-semibold"
+                          dangerouslySetInnerHTML={{ __html: formatInlineRichText(hc, false) }}
+                        />
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-800/60 bg-slate-900/50">
+                    {bodyRows.map((row, rIdx) => (
+                      <tr key={rIdx}>
+                        {row.map((cell, cIdx) => (
+                          <td
+                            key={cIdx}
+                            className="px-3 py-2"
+                            dangerouslySetInnerHTML={{ __html: formatInlineRichText(cell, false) }}
+                          />
+                        ))}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            );
+          }
+
+          // 6. 條列清單
+          const isListBlock = lines.every(
+            (l) =>
+              /^\s*[-*•]\s+/.test(l) ||
+              /^\s*\d+\.\s+/.test(l) ||
+              l.trim() === ''
+          );
+          if (isListBlock) {
+            const nonEmptyLines = lines.filter((l) => l.trim().length > 0);
+            const isOrdered = /^\s*\d+\.\s+/.test(nonEmptyLines[0] || '');
+            const ListTag = isOrdered ? 'ol' : 'ul';
+            return (
+              <ListTag
+                key={pIdx}
+                className={`${
+                  isOrdered ? 'list-decimal' : 'list-disc'
+                } list-inside space-y-1.5 pl-1 text-slate-200`}
+              >
+                {nonEmptyLines.map((it, itIdx) => {
+                  const cleanedItem = it
+                    .replace(/^\s*[-*•]\s+/, '')
+                    .replace(/^\s*\d+\.\s+/, '');
+                  return (
+                    <li key={itIdx} className="leading-relaxed">
+                      <span
+                        dangerouslySetInnerHTML={{
+                          __html: formatInlineRichText(cleanedItem, false),
+                        }}
+                      />
+                    </li>
+                  );
+                })}
+              </ListTag>
+            );
+          }
+
+          // 7. 一般段落
+          return (
+            <div key={pIdx} className="space-y-1">
+              {lines.map((line, lIdx) => {
+                const trimmedLine = line.trim();
+                if (!trimmedLine) return null;
+                if (/^[-*•]\s+/.test(trimmedLine)) {
+                  return (
+                    <div key={lIdx} className="flex items-start space-x-2 pl-2">
+                      <span className="text-emerald-400 mt-0.5">•</span>
+                      <span
+                        className="flex-1"
+                        dangerouslySetInnerHTML={{
+                          __html: formatInlineRichText(trimmedLine.replace(/^[-*•]\s+/, ''), false),
+                        }}
+                      />
+                    </div>
+                  );
+                }
+                return (
+                  <p
+                    key={lIdx}
+                    dangerouslySetInnerHTML={{
+                      __html: formatInlineRichText(line, false),
+                    }}
+                  />
+                );
+              })}
+            </div>
+          );
+        })}
+      </div>
+    );
+  };
+
+  return (
+    <div className="flex flex-col h-[calc(100vh-4rem)] max-w-6xl mx-auto px-2 sm:px-4 py-4">
+      {/* Top Controller Bar */}
+      <div className="bg-slate-900/90 border border-slate-800 rounded-xl p-3 mb-3 shadow-md flex flex-wrap items-center justify-between gap-2">
+        {/* Mode Selector */}
+        <div className="flex items-center space-x-1 sm:space-x-2 overflow-x-auto">
+          <span className="text-xs text-slate-400 font-medium hidden sm:inline">助教模式:</span>
+          <button
+            onClick={() => setMode('socratic')}
+            className={`flex items-center space-x-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium transition-all cursor-pointer ${
+              mode === 'socratic'
+                ? 'bg-emerald-600 text-white shadow-sm'
+                : 'text-slate-300 hover:bg-slate-800'
+            }`}
+          >
+            <Lightbulb className="w-3.5 h-3.5 text-yellow-300" />
+            <span>啟發提示 (不透漏答案)</span>
+          </button>
+
+          <button
+            onClick={() => setMode('diagnostic')}
+            className={`flex items-center space-x-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium transition-all cursor-pointer ${
+              mode === 'diagnostic'
+                ? 'bg-emerald-600 text-white shadow-sm'
+                : 'text-slate-300 hover:bg-slate-800'
+            }`}
+          >
+            <Compass className="w-3.5 h-3.5 text-cyan-300" />
+            <span>盲點診斷</span>
+          </button>
+
+          <button
+            onClick={() => setMode('standards')}
+            className={`flex items-center space-x-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium transition-all cursor-pointer ${
+              mode === 'standards'
+                ? 'bg-emerald-600 text-white shadow-sm'
+                : 'text-slate-300 hover:bg-slate-800'
+            }`}
+          >
+            <Scale className="w-3.5 h-3.5 text-amber-300" />
+            <span>法規標準引證</span>
+          </button>
+
+          <button
+            onClick={() => setMode('calculation')}
+            className={`flex items-center space-x-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium transition-all cursor-pointer ${
+              mode === 'calculation'
+                ? 'bg-emerald-600 text-white shadow-sm'
+                : 'text-slate-300 hover:bg-slate-800'
+            }`}
+          >
+            <Calculator className="w-3.5 h-3.5 text-violet-300" />
+            <span>排放計算引導</span>
+          </button>
+        </div>
+
+        {/* Tools and Actions */}
+        <div className="flex items-center space-x-1.5 sm:space-x-2 flex-wrap gap-y-1">
+          {/* Google Search Toggle */}
+          <button
+            onClick={() => setEnableSearch(!enableSearch)}
+            className={`flex items-center space-x-1 px-2.5 py-1.5 rounded-lg text-xs font-medium transition-all border cursor-pointer ${
+              enableSearch
+                ? 'bg-teal-950/80 border-teal-500 text-teal-300 shadow-sm'
+                : 'bg-slate-800 border-slate-700 text-slate-400 hover:text-slate-300'
+            }`}
+            title="開啟 Google Search Grounding 同步聯網查證最新環境部法規與國際標準"
+          >
+            <Globe className="w-3.5 h-3.5" />
+            <span className="hidden sm:inline">線上聯網查證</span>
+            <span
+              className={`w-2 h-2 rounded-full ml-1 ${
+                enableSearch ? 'bg-teal-400 animate-pulse' : 'bg-slate-600'
+              }`}
+            />
+          </button>
+
+          {/* API Key Status / Setting */}
+          {onOpenApiKeyModal && (
+            <button
+              onClick={onOpenApiKeyModal}
+              className={`flex items-center space-x-1 px-2.5 py-1.5 rounded-lg text-xs font-medium border transition-all cursor-pointer ${
+                hasApiKey()
+                  ? 'bg-emerald-950/70 border-emerald-700/60 text-emerald-300 hover:bg-emerald-900/60'
+                  : 'bg-amber-950/60 border-amber-700/50 text-amber-300 hover:bg-amber-900/60'
+              }`}
+              title={
+                hasApiKey()
+                  ? `目前模式：${getStoredModel() === 'auto' ? 'Auto 智慧防 503 高可用路由' : getStoredModel()} (點擊更換)`
+                  : '點擊設定 Gemini API Key'
+              }
+            >
+              <Key className="w-3.5 h-3.5" />
+              <span className="hidden md:inline">
+                {hasApiKey()
+                  ? `模型: ${getStoredModel() === 'auto' ? 'Auto 智慧防塞車' : getStoredModel().replace('gemini-', '')}`
+                  : '設定 Key'}
+              </span>
+            </button>
+          )}
+
+          <button
+            onClick={handleExportChatPdf}
+            disabled={isExportingPdf}
+            className={`px-2.5 py-1.5 rounded-lg text-xs font-medium flex items-center space-x-1.5 transition-all border cursor-pointer ${
+              isExportingPdf
+                ? 'bg-emerald-950/80 border-emerald-600 text-emerald-300'
+                : 'bg-slate-800/80 hover:bg-slate-700/80 text-slate-300 hover:text-emerald-300 border-slate-700'
+            }`}
+            title="將對話與解題重點匯出為 PDF 檔案"
+          >
+            {isExportingPdf ? (
+              <>
+                <span className="w-3.5 h-3.5 border-2 border-emerald-400 border-t-transparent rounded-full animate-spin" />
+                <span className="hidden sm:inline">{pdfProgress || '產生 PDF...'}</span>
+              </>
+            ) : (
+              <>
+                <FileText className="w-3.5 h-3.5 text-emerald-400" />
+                <span className="hidden sm:inline">匯出 PDF</span>
+              </>
+            )}
+          </button>
+
+          <button
+            onClick={handleClearChat}
+            className="p-1.5 rounded-lg text-slate-400 hover:text-red-300 hover:bg-slate-800 text-xs flex items-center space-x-1 transition-all cursor-pointer"
+            title="清空對話"
+          >
+            <RotateCcw className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      </div>
+
+      {/* Messages Scroll Area */}
+      <div className="flex-1 overflow-y-auto space-y-4 px-1 pb-4">
+        {messages.map((m) => {
+          const isUser = m.role === 'user';
+          const hasRagCitations = Boolean(m.ragCitations && m.ragCitations.length > 0);
+          const isCitationExpanded = Boolean(expandedCitationMsgIds[m.id]);
+
+          return (
+            <div
+              key={m.id}
+              className={`flex items-start space-x-3 ${
+                isUser ? 'flex-row-reverse space-x-reverse' : ''
+              }`}
+            >
+              <div
+                className={`w-8 h-8 rounded-lg flex items-center justify-center shrink-0 shadow-md ${
+                  isUser
+                    ? 'bg-blue-600 text-white'
+                    : 'bg-gradient-to-tr from-emerald-600 to-teal-500 text-white'
+                }`}
+              >
+                {isUser ? <User className="w-4 h-4" /> : <Bot className="w-4 h-4" />}
+              </div>
+
+              <div
+                className={`max-w-[88%] sm:max-w-[80%] rounded-2xl px-4 py-3 shadow-md ${
+                  isUser
+                    ? 'bg-blue-600 text-white rounded-tr-none'
+                    : 'bg-slate-900 border border-emerald-900/40 rounded-tl-none'
+                }`}
+              >
+                <div className="flex flex-wrap items-center justify-between gap-2 mb-1.5 border-b border-slate-700/30 pb-1.5">
+                  <div className="flex items-center space-x-2">
+                    <span className="text-xs font-medium text-emerald-400">
+                      {isUser ? '你 (考生)' : 'iPAS AI 備考助教'}
+                    </span>
+
+                    {/* Source Pipeline Badge */}
+                    {!isUser && m.sourceMode && (
+                      <span
+                        className={`inline-flex items-center space-x-1 px-2 py-0.5 rounded-full text-[10px] font-medium border ${
+                          hasRagCitations
+                            ? 'bg-emerald-950/90 border-emerald-700/60 text-emerald-300'
+                            : 'bg-teal-950/90 border-teal-700/60 text-teal-300'
+                        }`}
+                      >
+                        {hasRagCitations ? (
+                          <>
+                            <BookOpen className="w-2.5 h-2.5" />
+                            <span>
+                              優先引用 RAG 知識庫 ({m.ragCitations?.length} 段)
+                              {m.sourceMode === 'rag+web' ? ' + 聯網補充' : ''}
+                            </span>
+                          </>
+                        ) : (
+                          <>
+                            <Globe className="w-2.5 h-2.5" />
+                            <span>RAG 無直接匹配・已自動聯網搜尋</span>
+                          </>
+                        )}
+                      </span>
+                    )}
+                  </div>
+
+                  <div className="flex items-center space-x-2 text-[10px] text-slate-400">
+                    <span>{m.timestamp}</span>
+                    {!isUser && (
+                      <>
+                        <button
+                          onClick={() => handleCopy(m.id, m.content)}
+                          className="hover:text-emerald-300 transition-colors cursor-pointer"
+                          title="複製內容"
+                        >
+                          {copiedId === m.id ? (
+                            <Check className="w-3 h-3 text-emerald-400" />
+                          ) : (
+                            <Copy className="w-3 h-3" />
+                          )}
+                        </button>
+                        <button
+                          onClick={() => handleSpeak(m.id, m.content)}
+                          className="hover:text-emerald-300 transition-colors cursor-pointer"
+                          title="語音朗讀"
+                        >
+                          {speakingId === m.id ? (
+                            <VolumeX className="w-3 h-3 text-emerald-400 animate-pulse" />
+                          ) : (
+                            <Volume2 className="w-3 h-3" />
+                          )}
+                        </button>
+                      </>
+                    )}
+                  </div>
+                </div>
+
+                {isUser ? (
+                  <p className="text-sm leading-relaxed whitespace-pre-wrap">{m.content}</p>
+                ) : (
+                  <div>{renderFormattedContent(m.content)}</div>
+                )}
+
+                {/* RAG Citations Expandable Drawer */}
+                {!isUser && hasRagCitations && (
+                  <div className="mt-3 pt-2.5 border-t border-slate-800/90 text-xs">
+                    <button
+                      onClick={() => toggleCitationExpand(m.id)}
+                      className="w-full flex items-center justify-between text-left px-2.5 py-1.5 rounded-lg bg-emerald-950/40 hover:bg-emerald-950/70 border border-emerald-800/40 text-emerald-300 transition-all cursor-pointer"
+                    >
+                      <span className="flex items-center space-x-1.5 font-medium">
+                        <Database className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                        <span>
+                          📚 本次回答優先引用的 RAG 教材與考古題依據 ({m.ragCitations?.length} 處)
+                        </span>
+                      </span>
+                      <span className="flex items-center space-x-1 text-[11px] text-emerald-400">
+                        <span>{isCitationExpanded ? '收合原文' : '展開檢視原文'}</span>
+                        {isCitationExpanded ? (
+                          <ChevronUp className="w-3.5 h-3.5" />
+                        ) : (
+                          <ChevronDown className="w-3.5 h-3.5" />
+                        )}
+                      </span>
+                    </button>
+
+                    {isCitationExpanded && (
+                      <div className="mt-2 space-y-2 pl-1">
+                        {m.ragCitations?.map((cit, idx) => (
+                          <div
+                            key={cit.chunkId}
+                            className="bg-slate-950/90 border border-slate-800 rounded-xl p-2.5 space-y-1"
+                          >
+                            <div className="flex items-center justify-between text-[11px]">
+                              <span className="font-semibold text-emerald-300">
+                                📖 [{idx + 1}] {cit.docName} — {cit.pageOrSection}
+                              </span>
+                              <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-900 text-slate-400 border border-slate-800">
+                                檢索分數 {cit.score}
+                              </span>
+                            </div>
+                            <p
+                              className="text-[11px] text-slate-300 leading-relaxed"
+                              dangerouslySetInnerHTML={{
+                                __html: formatInlineRichText(cit.snippet, false),
+                              }}
+                            />
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* Web Search Grounding references if present */}
+                {m.groundingUrls && m.groundingUrls.length > 0 && (
+                  <div className="mt-3 pt-2 border-t border-slate-800 text-xs">
+                    <span className="text-teal-400 font-medium flex items-center space-x-1 mb-1">
+                      <Globe className="w-3 h-3" />
+                      <span>🌐 網路搜尋查證來源 (Google Search Grounding):</span>
+                    </span>
+                    <ul className="space-y-1">
+                      {m.groundingUrls.map((link, idx) => (
+                        <li key={idx}>
+                          <a
+                            href={link.uri}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="text-slate-400 hover:text-emerald-300 flex items-center space-x-1 transition-colors truncate"
+                          >
+                            <ExternalLink className="w-3 h-3 shrink-0" />
+                            <span className="truncate">{link.title || link.uri}</span>
+                          </a>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+              </div>
+            </div>
+          );
+        })}
+
+        {isLoading && (
+          <div className="flex items-center space-x-2 text-slate-400 text-xs pl-11">
+            <span className="w-2 h-2 rounded-full bg-emerald-400 animate-ping" />
+            <span>AI 助教正在連線分析考點並生成專業解答...</span>
+          </div>
+        )}
+        <div ref={messagesEndRef} />
+      </div>
+
+      {/* Suggested Quick Prompts */}
+      <div className="py-2 overflow-x-auto flex items-center space-x-2 text-xs scrollbar-none">
+        <span className="text-slate-400 whitespace-nowrap flex items-center space-x-1 text-[11px]">
+          <Sparkles className="w-3 h-3 text-emerald-400" />
+          <span>精選練習:</span>
+        </span>
+        {quickPrompts.map((qp, index) => (
+          <button
+            key={index}
+            onClick={() => handleSendMessage(qp.prompt)}
+            disabled={isLoading}
+            className="px-2.5 py-1 bg-slate-800/80 hover:bg-slate-700/80 text-slate-300 hover:text-emerald-300 rounded-full border border-slate-700 whitespace-nowrap transition-all cursor-pointer text-xs"
+          >
+            {qp.label}
+          </button>
+        ))}
+      </div>
+
+      {/* Input Form */}
+      <div className="bg-slate-900 border border-slate-800 rounded-xl p-2 shadow-lg focus-within:border-emerald-600 transition-all">
+        <form
+          onSubmit={(e) => {
+            e.preventDefault();
+            handleSendMessage();
+          }}
+          className="flex items-end space-x-2"
+        >
+          <textarea
+            ref={inputRef}
+            rows={2}
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                handleSendMessage();
+              }
+            }}
+            placeholder="貼上考題、詢問觀念或輸入選項答案（如 A、B、C、D）... (Enter 送出)"
+            className="flex-1 bg-transparent border-0 text-slate-100 placeholder-slate-500 text-sm focus:ring-0 resize-none p-1.5 focus:outline-none"
+          />
+
+          <button
+            type="submit"
+            disabled={isLoading || !input.trim()}
+            className={`p-2.5 rounded-lg flex items-center justify-center transition-all ${
+              isLoading || !input.trim()
+                ? 'bg-slate-800 text-slate-600 cursor-not-allowed'
+                : 'bg-emerald-600 hover:bg-emerald-500 text-white shadow-md shadow-emerald-700/20 cursor-pointer'
+            }`}
+          >
+            <Send className="w-4 h-4" />
+          </button>
+        </form>
+      </div>
+    </div>
+  );
+};
